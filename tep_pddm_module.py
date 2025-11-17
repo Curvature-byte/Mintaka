@@ -56,7 +56,7 @@ def compute_shannon_entropy(x: np.ndarray, n_bins: int = 30) -> float:
     return entropy
 
 
-def compute_batch_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
+def compute_variable_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
     """
     计算批量样本的Shannon熵
     
@@ -67,11 +67,11 @@ def compute_batch_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
     Returns:
         entropies: 每个样本的熵值 (n_samples,)
     """
-    n_samples = X.shape[0]
-    entropies = np.zeros(n_samples)
+    n_features = X.shape[1]
+    entropies = np.zeros(n_features)
     
-    for i in range(n_samples):
-        entropies[i] = compute_shannon_entropy(X[i], n_bins)
+    for j in range(n_features):
+        entropies[j] = compute_shannon_entropy(X[:,j], n_bins)
     
     return entropies
 
@@ -91,149 +91,181 @@ def entropy_based_similarity(x_i: np.ndarray, x_j: np.ndarray, n_bins: int = 30)
     Returns:
         similarity: 相似度分数 [0, 1]
     """
-    H_i = compute_shannon_entropy(x_i, n_bins)
-    H_j = compute_shannon_entropy(x_j, n_bins)
+    x_i = x_i.flatten()
+    x_j = x_j.flatten()
     
-    # 相似度 = exp(-熵差的绝对值)
-    similarity = 0.75 * (np.abs((H_i + H_j) / 2 - 0.5) - np.abs((H_i - H_j) / 2 + 0.5))
+    # 1. 计算欧几里得距离的平方
+    distance_sq = np.sum((x_i - x_j)**2)
+    
+    # 2. 通过高斯核 (RBF Kernel) 转换为相似度
+    similarity = np.exp(-distance_sq / (2 * sigma**2))
     
     return similarity
 
+def _find_closest_row_idx(X: np.ndarray, col_idx: int) -> int:
+    """
+    为指定列 (col_idx) 找到中位数，
+    并返回 X 中最接近该中位数的值 所在的 "行索引"。
+    """
+    column_data = X[:, col_idx]
+    median_val = np.median(column_data)
+    
+    # 找到该列中，哪个值与中位数最接近，并返回那一行的索引
+    row_idx = np.argmin(np.abs(column_data - median_val))
+    return int(row_idx)
 
+# ============================================================================
+# 3. 查找三对样本 
+# ============================================================================
 def find_three_pairs_entropy(
     X: np.ndarray,
     n_bins: int = 30,
     verbose: bool = False
-) ->  Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     对于每一批训练样本中，使用香农熵确立几个关键样本点，选择三对样本:
     
-     理论：
-        - 前22个操控变量和后11个操控变量（考虑到19个成分测量具有显著的时间延迟）
-    
-    选择策略：
-        Step 1: (x_i, x_j) - 中间对
-            - x_i ∈ P, x_j ∈ M
-            - 熵接近均值：|H_i - H_mean| + |H_j - H_mean| 最小
-        
-        Step 2: (x_k, x_l) - 操控变量极端对
-            - x_k: M 中与 x_i 熵差最大
-            - x_l: M 中与 x_k 熵差最大
-        
-        Step 3: (x_m, x_n) - 过程变量极端对
-            - x_m: P 中与 x_j 熵差最大
-            - x_n: P 中与 x_m 熵差最大
+    【修改后的新逻辑】:
+    1.  按“列”计算熵 H(j)，而不是按“行”。
+    2.  P 和 M 是“列”的集合 (P: 0-21, M: 22-32)。
+    3.  算法 (Step 1-3) 用于选择6个代表性的“列索引”。
+    4.  对每个选定的“列”，找到该列的中位数。
+    5.  选择“行”，该行的值最接近其对应列的中位数。
     
     Args:
-        X: 特征矩阵 (n_samples, n_features) - 仅包含33个输入变量
+        X: 特征矩阵 (n_samples, n_features) 
+           【重要假设】: X 仅包含33个输入变量，
+           并且前22个 (0-21) 是P组, 后11个 (22-32) 是M组。
         n_bins: 熵计算的分箱数
         verbose: 是否打印调试信息
     
     Returns:
-        three_pairs: (6, n_features) 六个样本
-        indices: (6,) 在原始数据中的索引
+        three_pairs: (6, n_features) 六个被选中的样本(行)
+        indices: (6,) 在原始数据中的行索引
     """
-     # 计算所有样本的香农熵
-    entropies = compute_batch_entropy(X, n_bins)
-    H_mean = entropies.mean()
+    n_samples, n_features = X.shape
+
+    # 假设: X 包含 33 个输入变量 (22 P-vars, 11 M-vars)
+    if n_features < 33:
+         print(f"Warning: 输入 X 只有 {n_features} 个变量, 预期 33 个。将使用随机选择。")
+         indices = np.random.choice(n_samples, 6, replace=False)
+         return X[indices], indices
     
-    # 分离过程变量（P）和操控变量（M）
-    I_P = X[:,3:22]     # 过程变量（P）
-    I_M = X[:,-19:-1]  # 操控变量（M）
+    # 定义P和M的 *列索引*
+    # 假设 X = [xmeas_1...xmeas_22, xmv_1...xmv_11]
+    P_col_indices = np.arange(0, 22) # 过程变量 (P组, 22个)
+    M_col_indices = np.arange(22, 33) # 操控变量 (M组, 11个)
+
+    # 1. 计算所有 *列* 的香农熵 (有意义的熵)
+    all_col_entropies = compute_variable_entropy(X, n_bins) # Shape (n_features,)
     
-    if len(I_M) < 3 or len(I_P) < 3:
-        # 样本不足，随机选择
-        if verbose:
-            print("Warning: 样本不足，随机选择")
-        indices = np.random.choice(len(X), 6, replace=False)
-        return X[indices], indices
+    H_P = all_col_entropies[P_col_indices] # Shape (22,)
+    H_M = all_col_entropies[M_col_indices] # Shape (11,)
     
-    H_M = entropies[I_M]  # 操控变量的熵
-    H_P = entropies[I_P]  # 过程变量的熵
-    
+    # 仅使用 P 和 M 变量的熵来计算均值
+    H_mean = all_col_entropies[np.concatenate([P_col_indices, M_col_indices])].mean()
+
     if verbose:
-        print(f"香农熵统计:")
-        print(f"  总体均值: {H_mean:.4f}")
-        print(f"  操控变量 M (控制组): 均值={H_M.mean():.4f}, std={H_M.std():.4f}")
-        print(f"  过程变量 P (治疗组): 均值={H_P.mean():.4f}, std={H_P.std():.4f}")
-        # print(f"  验证格兰杰原理: H(M)={H_M.mean():.4f} {'<' if H_M.mean() < H_P.mean() else '>'} H(P)={H_P.mean():.4f}")
-    
-    # ========================================
-    # Step 1: 选择中间对 (x_i, x_j)
-    # ========================================
-    # 目标: argmin_{i∈P, j∈M} |H_i - H_mean| + |H_j - H_mean|
-    
+        print(f"香农熵统计 (按列计算):")
+        print(f"  总体均值 (P+M): {H_mean:.4f}")
+        print(f"  操控变量 M (列 22-32): 均值={H_M.mean():.4f}, std={H_M.std():.4f}")
+        print(f"  过程变量 P (列 0-21): 均值={H_P.mean():.4f}, std={H_P.std():.4f}")
+
+    # ==========================================================
+    # Step 1: 选择中间对 (x_i, x_j) - [选择 列]
+    # ==========================================================
     min_dist = np.inf
     idx_i_local, idx_j_local = 0, 0
     
-    for i in range(len(I_P)):
-        for j in range(len(I_M)):
-            dist = abs(H_P                                                                                                                          [i] - H_mean) + abs(H_M[j] - H_mean)
+    for i in range(len(H_P)):
+        for j in range(len(H_M)):
+            dist = abs(H_P[i] - H_mean) + abs(H_M[j] - H_mean)
             if dist < min_dist:
                 min_dist = dist
-                idx_i_local = i
-                idx_j_local = j
-    
-    H_i = H_P[idx_i_local]
-    H_j = H_M[idx_j_local]
+                idx_i_local = i # P组中的局部 *列* 索引
+                idx_j_local = j # M组中的局部 *列* 索引
+
+    H_i_col = H_P[idx_i_local]
+    H_j_col = H_M[idx_j_local]
     
     if verbose:
-        print(f"\nStep 1: 中间对")
-        print(f"  x_i (过程变量): H={H_i:.4f}, |H-mean|={abs(H_i-H_mean):.4f}")
-        print(f"  x_j (操控变量): H={H_j:.4f}, |H-mean|={abs(H_j-H_mean):.4f}")
+        print(f"\nStep 1: 中间对 (选择 列)")
+        print(f"  列 i (P组, 局部索引 {idx_i_local}): H={H_i_col:.4f}")
+        print(f"  列 j (M组, 局部索引 {idx_j_local}): H={H_j_col:.4f}")
+
+    # ==========================================================
+    # Step 2: 选择操控变量极端对 (x_k, x_l) - [选择 列]
+    # ==========================================================
+    idx_k_local = np.argmax(np.abs(H_M - H_i_col))
+    H_k_col = H_M[idx_k_local]
     
-    # ========================================
-    # Step 2: 选择操控变量极端对 (x_k, x_l)
-    # ========================================
-    # x_k: argmax_{k∈M} |H_k - H_i|
-    idx_k_local = np.argmax(np.abs(H_M - H_i))
-    H_k = H_M[idx_k_local]
-    # x_l: argmax_{l∈M} |H_l - H_k|（但不是 x_k 自己）
-    dist_to_k = np.abs(H_M - H_k)
-    dist_to_k[idx_k_local] = -1  # 排除 x_k 自己
+    dist_to_k = np.abs(H_M - H_k_col)
+    dist_to_k[idx_k_local] = -1 # 排除自己
     idx_l_local = np.argmax(dist_to_k)
-    H_l = H_M[idx_l_local]
+    H_l_col = H_M[idx_l_local]
     
     if verbose:
-        print(f"\nStep 2: 操控变量极端对")
-        print(f"  x_k: H={H_k:.4f}, |H_k-H_i|={abs(H_k-H_i):.4f}")
-        print(f"  x_l: H={H_l:.4f}, |H_l-H_k|={abs(H_l-H_k):.4f}")
+        print(f"\nStep 2: 操控变量极端对 (选择 列)")
+        print(f"  列 k (M组, 局部索引 {idx_k_local}): H={H_k_col:.4f}")
+        print(f"  列 l (M组, 局部索引 {idx_l_local}): H={H_l_col:.4f}")
+
+    # ==========================================================
+    # Step 3: 选择过程变量极端对 (x_m, x_n) - [选择 列]
+    # ==========================================================
+    idx_m_local = np.argmax(np.abs(H_P - H_j_col))
+    H_m_col = H_P[idx_m_local]
     
-    # ========================================
-    # Step 3: 选择过程变量极端对 (x_m, x_n)
-    # ========================================
-    # x_m: argmax_{m∈P} |H_m - H_j|
-    idx_m_local = np.argmax(np.abs(H_P - H_j))
-    H_m = H_P[idx_m_local]
-    
-    # x_n: argmax_{n∈P} |H_n - H_m|（但不是 x_m 自己）
-    dist_to_m = np.abs(H_P - H_m)
-    dist_to_m[idx_m_local] = -1  # 排除 x_m 自己
+    dist_to_m = np.abs(H_P - H_m_col)
+    dist_to_m[idx_m_local] = -1 # 排除自己
     idx_n_local = np.argmax(dist_to_m)
-    H_n = H_P[idx_n_local]
+    H_n_col = H_P[idx_n_local]
     
     if verbose:
-        print(f"\nStep 3: 过程变量极端对")
-        print(f"  x_m: H={H_m:.4f}, |H_m-H_j|={abs(H_m-H_j):.4f}")
-        print(f"  x_n: H={H_n:.4f}, |H_n-H_m|={abs(H_n-H_m):.4f}")
+        print(f"\nStep 3: 过程变量极端对 (选择 列)")
+        print(f"  列 m (P组, 局部索引 {idx_m_local}): H={H_m_col:.4f}")
+        print(f"  列 n (P组, 局部索引 {idx_n_local}): H={H_n_col:.4f}")
+        
+    # ==========================================================
+    # Step 4: 将局部 "列索引" 转换为 全局 "列索引"
+    # ==========================================================
+    selected_col_indices = {
+        'i': P_col_indices[idx_i_local], # 对应的全局列索引 (0-21)
+        'j': M_col_indices[idx_j_local], # 对应的全局列索引 (22-32)
+        'k': M_col_indices[idx_k_local],
+        'l': M_col_indices[idx_l_local],
+        'm': P_col_indices[idx_m_local],
+        'n': P_col_indices[idx_n_local],
+    }
+    if verbose:
+        print(f"\nStep 4: 选定的全局列索引: {selected_col_indices}")
+
+    # ==========================================================
+    # Step 5: 根据选定的 "列", 选择最接近中位数的 "行"
+    # ==========================================================
     
-    # ========================================
-    # 组装三对样本
-    # ========================================
-    indices = np.array([
-        I_P[idx_i_local],  # x_i: 过程变量中间
-        I_M[idx_j_local],  # x_j: 操控变量中间
-        I_M[idx_k_local],  # x_k: 操控变量极端
-        I_M[idx_l_local],  # x_l: 操控变量相似
-        I_P[idx_m_local],  # x_m: 过程变量极端
-        I_P[idx_n_local],  # x_n: 过程变量相似
-    ])
+    # 注意：这里可能会选到同一行，这是正常的。
+    # 如果想避免重复，可以增加额外逻辑，但目前先按最接近中位数处理。
+    selected_row_indices = [
+        _find_closest_row_idx(X, selected_col_indices['i']), # 寻找 x_i 对应的行
+        _find_closest_row_idx(X, selected_col_indices['j']), # 寻找 x_j 对应的行
+        _find_closest_row_idx(X, selected_col_indices['k']), # 寻找 x_k 对应的行
+        _find_closest_row_idx(X, selected_col_indices['l']), # 寻找 x_l 对应的行
+        _find_closest_row_idx(X, selected_col_indices['m']), # 寻找 x_m 对应的行
+        _find_closest_row_idx(X, selected_col_indices['n']), # 寻找 x_n 对应的行
+    ]
     
-    three_pairs = X[indices]
+    indices = np.array(selected_row_indices)
+    
+    if verbose:
+         print(f"\nStep 5: 选定的最终行索引: {indices}")
+         # 检查是否有重复
+         if len(np.unique(indices)) != 6:
+             print(f"Warning: 选中的行索引有重复: {indices}")
+
+    # 组装样本 (行)
+    three_pairs = X[indices] # Shape (6, n_features)
     
     return three_pairs, indices
-
-
 # ============================================================================
 # 3. 基于熵差计算相似度
 # ============================================================================
@@ -310,7 +342,7 @@ class PDDMNetwork(nn.Module):
             u_v_hidden_dim: 用于 u_1 和 v_1 子网络的隐藏层维度。
             h_hidden_dim: 用于 h 层的隐藏层维度 (即 W_c 的输出维度)。
         """
-        super(PDDMComplexNetwork, self).__init__()
+        super(PDDMNetwork, self).__init__()
         
         # 参数 W_u, b_u 用于计算 u_1
         self.W_u = nn.Linear(latent_dim, u_v_hidden_dim)
@@ -372,12 +404,7 @@ class PDDMNetwork(nn.Module):
 
 def compute_pddm_loss(
     pddm_net: PDDMNetwork,
-    x_i: torch.Tensor,
-    x_j: torch.Tensor,
-    x_k: torch.Tensor,
-    x_l: torch.Tensor,
-    x_m: torch.Tensor,
-    x_n: torch.Tensor,
+    three_pairs: np.ndarray,
     target_similarities: Dict[str, float]
 ) -> torch.Tensor:
     """
@@ -395,269 +422,25 @@ def compute_pddm_loss(
         loss: PDDM损失值
     """
     # 预测相似度
-    pred_s_ij = pddm_net(x_i, x_j).squeeze()
-    pred_s_kl = pddm_net(x_k, x_l).squeeze()
-    pred_s_mn = pddm_net(x_m, x_n).squeeze()
-    pred_s_i_kl_k = pddm_net(x_i, x_k).squeeze()
-    pred_s_i_kl_l = pddm_net(x_i, x_l).squeeze()
-    pred_s_i_kl = (pred_s_i_kl_k + pred_s_i_kl_l) / 2.0
-    pred_s_j_mn_m = pddm_net(x_j, x_m).squeeze()
-    pred_s_j_mn_n = pddm_net(x_j, x_n).squeeze()
-    pred_s_j_mn = (pred_s_j_mn_m + pred_s_j_mn_n) / 2.0
+    pred_s_kl = pddm_net(three_pairs[2], three_pairs[3]).squeeze()
+    pred_s_mn = pddm_net(three_pairs[4], three_pairs[5]).squeeze()
+    pred_s_km = pddm_net(three_pairs[2], three_pairs[4]).squeeze()
+    pred_s_ik = pddm_net(three_pairs[0], three_pairs[2]).squeeze()
+    pred_s_jm = pddm_net(three_pairs[1], three_pairs[4]).squeeze()
     
     # 目标相似度
-    device = x_i.device
-    target_s_ij = torch.tensor(target_similarities['s_ij'], device=device, dtype=torch.float32)
-    target_s_kl = torch.tensor(target_similarities['s_kl'], device=device, dtype=torch.float32)
-    target_s_mn = torch.tensor(target_similarities['s_mn'], device=device, dtype=torch.float32)
-    target_s_i_kl = torch.tensor(target_similarities['s_i_kl'], device=device, dtype=torch.float32)
-    target_s_j_mn = torch.tensor(target_similarities['s_j_mn'], device=device, dtype=torch.float32)
+    target_similarities= compute_three_pairs_similarity_granger(three_pairs,10)
     
+    target_similarities = torch.tensor(target_similarities, dtype=torch.float32)
+
+
     # MSE损失
     loss = (
-        F.mse_loss(pred_s_ij, target_s_ij) +
-        F.mse_loss(pred_s_kl, target_s_kl) +
-        F.mse_loss(pred_s_mn, target_s_mn) +
-        F.mse_loss(pred_s_i_kl, target_s_i_kl) +
-        F.mse_loss(pred_s_j_mn, target_s_j_mn)
+        F.mse_loss(pred_s_kl, target_similarities[0]) +
+        F.mse_loss(pred_s_mn, target_similarities[1]) +
+        F.mse_loss(pred_s_km, target_similarities[2]) +
+        F.mse_loss(pred_s_ik, target_similarities[3]) +
+        F.mse_loss(pred_s_jm, target_similarities[4])
     )
     
-    return loss
-
-
-def compute_mid_point_distance(
-    phi_i: torch.Tensor,
-    phi_j: torch.Tensor,
-    distance_type: str = 'euclidean'
-) -> torch.Tensor:
-    """
-    计算表示层中间对的距离
-    
-    用于全局平衡，确保正常样本和故障样本在表示空间中的距离适中
-    
-    Args:
-        phi_i: 正常样本的表示 (representation_dim,) 或 (batch_size, representation_dim)
-        phi_j: 故障样本的表示 (representation_dim,) 或 (batch_size, representation_dim)
-        distance_type: 距离类型，'euclidean'或'cosine'
-    
-    Returns:
-        distance: 距离值
-    """
-    if distance_type == 'euclidean':
-        # 欧氏距离
-        distance = torch.norm(phi_i - phi_j, p=2)
-    elif distance_type == 'cosine':
-        # 余弦距离 = 1 - 余弦相似度
-        cosine_sim = F.cosine_similarity(phi_i, phi_j, dim=-1)
-        distance = 1.0 - cosine_sim
-    else:
-        raise ValueError(f"不支持的距离类型: {distance_type}")
-    
-    return distance
-
-
-def compute_representation_similarity_loss(
-    pddm_net: PDDMNetwork,
-    phi_i: torch.Tensor,
-    phi_j: torch.Tensor,
-    phi_k: torch.Tensor,
-    phi_l: torch.Tensor,
-    phi_m: torch.Tensor,
-    phi_n: torch.Tensor,
-    target_similarities: Dict[str, float]
-) -> torch.Tensor:
-    """
-    计算表示层的PDDM相似度损失
-    
-    这个函数在表示层(representation layer)而非输入层计算PDDM损失
-    
-    Args:
-        pddm_net: PDDM网络
-        phi_i, phi_j, phi_k, phi_l, phi_m, phi_n: 六个样本的表示向量
-        target_similarities: 目标相似度(由输入层熵计算得到)
-    
-    Returns:
-        loss: 表示层PDDM损失
-    """
-    return compute_pddm_loss(
-        pddm_net, phi_i, phi_j, phi_k, phi_l, phi_m, phi_n,
-        target_similarities
-    )
-
-
-class TEPDataPreprocessor:
-    """
-    TEP数据预处理器
-    
-    功能:
-    1. 提取39个输入变量 (xmeas_1到xmeas_22 + xmeas_23到xmeas_39)
-    2. 标准化特征
-    3. 准备故障标签
-    """
-    
-    def __init__(self):
-        self.scaler = StandardScaler()
-        self.is_fitted = False
-        
-        # TEP变量名称
-        self.process_vars = [f'xmeas_{i}' for i in range(1, 23)]  # xmeas_1 to xmeas_22
-        self.component_vars = [f'xmeas_{i}' for i in range(23, 40)]  # xmeas_23 to xmeas_39 (排除40,41)
-        self.input_vars = self.process_vars + self.component_vars  # 总共39个变量
-    
-    def fit(self, df):
-        """
-        拟合标准化器
-        
-        Args:
-            df: pandas DataFrame，包含TEP数据
-        """
-        X = df[self.input_vars].values
-        self.scaler.fit(X)
-        self.is_fitted = True
-        return self
-    
-    def transform(self, df):
-        """
-        转换数据
-        
-        Args:
-            df: pandas DataFrame，包含TEP数据
-        
-        Returns:
-            X: 标准化后的输入特征 (n_samples, 39)
-            fault_labels: 故障标签 (n_samples,)
-        """
-        if not self.is_fitted:
-            raise ValueError("预处理器未拟合，请先调用fit()")
-        
-        X = df[self.input_vars].values
-        X_scaled = self.scaler.transform(X)
-        fault_labels = df['faultNumber'].values
-        
-        return X_scaled, fault_labels
-    
-    def fit_transform(self, df):
-        """
-        拟合并转换数据
-        
-        Args:
-            df: pandas DataFrame，包含TEP数据
-        
-        Returns:
-            X: 标准化后的输入特征 (n_samples, 39)
-            fault_labels: 故障标签 (n_samples,)
-        """
-        self.fit(df)
-        return self.transform(df)
-
-
-def prepare_tep_data_for_pddm(
-    df,
-    n_bins: int = 30,
-    fault_free_label: int = 0
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
-    """
-    准备TEP数据用于PDDM训练
-    
-    完整流程:
-    1. 提取39个输入变量并标准化
-    2. 计算信息熵并选择三对样本
-    3. 计算目标相似度
-    
-    Args:
-        df: pandas DataFrame，TEP数据
-        n_bins: 熵计算分箱数
-        fault_free_label: 正常工况标签
-    
-    Returns:
-        samples: 六个样本 (6, 39)
-        fault_labels: 对应的故障标签 (6,)
-        target_similarities: 目标相似度字典
-    """
-    # 数据预处理
-    preprocessor = TEPDataPreprocessor()
-    X, fault_labels = preprocessor.fit_transform(df)
-    
-    # 选择三对样本
-    x_i, x_j, x_k, x_l, x_m, x_n = find_three_pairs_entropy(
-        X, fault_labels, n_bins, fault_free_label
-    )
-    
-    # 计算目标相似度
-    target_similarities = compute_three_pairs_similarity_entropy(
-        x_i, x_j, x_k, x_l, x_m, x_n, n_bins
-    )
-    
-    # 组织返回结果
-    samples = np.stack([x_i, x_j, x_k, x_l, x_m, x_n], axis=0)
-    
-    return samples, fault_labels, target_similarities
-
-
-# ==================== 使用示例 ====================
-
-def example_usage():
-    """
-    使用示例 - 展示如何在TEP数据上使用PDDM
-    
-    注意: 这只是示例框架，实际使用时需要加载真实的TEP数据
-    """
-    import pandas as pd
-    
-    # 假设你已经加载了TEP数据
-    # df = pd.read_csv('tep_data.csv')
-    
-    print("=" * 60)
-    print("TEP PDDM模块使用示例")
-    print("=" * 60)
-    
-    # 示例1: 数据预处理
-    print("\n1. 数据预处理")
-    print("-" * 60)
-    print("变量配置:")
-    print("  - 过程变量: xmeas_1 到 xmeas_22 (22个)")
-    print("  - 成分变量: xmeas_23 到 xmeas_39 (17个)")
-    print("  - 总输入维度: 39")
-    print("  - 排除变量: xmeas_40, xmeas_41 (结果变量)")
-    
-    # 示例2: PDDM网络初始化
-    print("\n2. PDDM网络初始化")
-    print("-" * 60)
-    input_dim = 39  # TEP输入维度
-    hidden_dim = 64
-    pddm_net = PDDMNetwork(input_dim, hidden_dim)
-    print(f"PDDM网络结构:")
-    print(f"  - 输入维度: {input_dim} × 2 = {input_dim * 2} (u和v拼接)")
-    print(f"  - 隐藏层维度: {hidden_dim}")
-    print(f"  - 输出维度: 1 (相似度分数)")
-    print(f"  - 参数量: {sum(p.numel() for p in pddm_net.parameters())}")
-    
-    # 示例3: 训练流程说明
-    print("\n3. 训练流程")
-    print("-" * 60)
-    print("步骤:")
-    print("  Step 1: 数据预处理 - 提取39个输入变量，标准化")
-    print("  Step 2: 计算信息熵 - 为每个样本计算Shannon熵")
-    print("  Step 3: 选择三对样本 - 基于Granger因果原理")
-    print("    - 中间对(x_i, x_j): 一个正常+一个故障，熵接近均值")
-    print("    - 正常极端对(x_k, x_l): 两个正常工况样本")
-    print("    - 故障极端对(x_m, x_n): 两个故障工况样本")
-    print("  Step 4: 计算目标相似度 - 使用熵差计算5个相似度分数")
-    print("  Step 5: PDDM训练 - 最小化预测相似度与目标相似度的MSE")
-    
-    # 示例4: 损失函数组成
-    print("\n4. 总损失函数")
-    print("-" * 60)
-    print("Total Loss = α·Pred_Loss + β·PDDM_Loss + γ·Mid_Distance")
-    print("  - Pred_Loss: 预测损失 (如分类交叉熵)")
-    print("  - PDDM_Loss: 相似度匹配损失 (5个MSE项之和)")
-    print("  - Mid_Distance: 中间对距离损失 (全局平衡)")
-    print("  - α, β, γ: 超参数权重")
-    
-    print("\n" + "=" * 60)
-    print("模块准备完成！")
-    print("=" * 60)
-
-
-if __name__ == "__main__":
-    example_usage()
+    return loss / 5.0
