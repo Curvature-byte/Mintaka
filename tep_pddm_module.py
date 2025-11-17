@@ -78,9 +78,9 @@ def compute_batch_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
 
 def entropy_based_similarity(x_i: np.ndarray, x_j: np.ndarray, n_bins: int = 30) -> float:
     """
-    基于信息熵的相似度计算
+    基于原始变量之间的相似度
     
-    相似度定义: s(i,j) = exp(-|H(x_i) - H(x_j)|)
+    相似度定义: s(i,j) = S(i,j)=0.75(|h_i+h_j/2-0.5|-|h_i-h_j/2+0.5|)
     熵差越小，相似度越高
     
     Args:
@@ -95,221 +95,280 @@ def entropy_based_similarity(x_i: np.ndarray, x_j: np.ndarray, n_bins: int = 30)
     H_j = compute_shannon_entropy(x_j, n_bins)
     
     # 相似度 = exp(-熵差的绝对值)
-    similarity = np.exp(-np.abs(H_i - H_j))
+    similarity = 0.75 * (np.abs((H_i + H_j) / 2 - 0.5) - np.abs((H_i - H_j) / 2 + 0.5))
     
     return similarity
 
 
 def find_three_pairs_entropy(
     X: np.ndarray,
-    fault_labels: np.ndarray,
     n_bins: int = 30,
-    fault_free_label: int = 0
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    verbose: bool = False
+) ->  Tuple[np.ndarray, np.ndarray]:
     """
-    基于Granger因果和信息熵选择三对样本
+    对于每一批训练样本中，使用香农熵确立几个关键样本点，选择三对样本:
     
-    TEP数据中:
-    - fault_free_label (0): 正常工况 (类比为对照组/操纵变量M)
-    - fault_labels (1-20): 故障工况 (类比为处理组/过程变量P)
+     理论：
+        - 前22个操控变量和后11个操控变量（考虑到19个成分测量具有显著的时间延迟）
     
-    根据Granger因果原理: H(M) ≤ H(P)
-    正常工况的熵应该小于等于故障工况的熵
-    
-    三步选择过程:
-    Step 1: 选择中间对 (x_i, x_j) - 一个正常，一个故障，熵值接近均值
-    Step 2: 选择正常工况极端对 (x_k, x_l) - 两个都是正常工况
-    Step 3: 选择故障工况极端对 (x_m, x_n) - 两个都是故障工况
+    选择策略：
+        Step 1: (x_i, x_j) - 中间对
+            - x_i ∈ P, x_j ∈ M
+            - 熵接近均值：|H_i - H_mean| + |H_j - H_mean| 最小
+        
+        Step 2: (x_k, x_l) - 操控变量极端对
+            - x_k: M 中与 x_i 熵差最大
+            - x_l: M 中与 x_k 熵差最大
+        
+        Step 3: (x_m, x_n) - 过程变量极端对
+            - x_m: P 中与 x_j 熵差最大
+            - x_n: P 中与 x_m 熵差最大
     
     Args:
-        X: 特征矩阵 (n_samples, n_features) - 仅包含39个输入变量
-        fault_labels: 故障标签 (n_samples,) - 0表示正常，1-20表示故障类型
+        X: 特征矩阵 (n_samples, n_features) - 仅包含33个输入变量
         n_bins: 熵计算的分箱数
-        fault_free_label: 正常工况标签，默认为0
+        verbose: 是否打印调试信息
     
     Returns:
-        x_i, x_j: 中间对 (正常-故障混合对)
-        x_k, x_l: 正常工况极端对
-        x_m, x_n: 故障工况极端对
+        three_pairs: (6, n_features) 六个样本
+        indices: (6,) 在原始数据中的索引
     """
-    # 计算所有样本的Shannon熵
+     # 计算所有样本的香农熵
     entropies = compute_batch_entropy(X, n_bins)
     H_mean = entropies.mean()
     
-    # 分离正常工况(M)和故障工况(P)
-    normal_mask = (fault_labels == fault_free_label)
-    fault_mask = ~normal_mask
+    # 分离过程变量（P）和操控变量（M）
+    I_P = X[:,3:22]     # 过程变量（P）
+    I_M = X[:,-19:-1]  # 操控变量（M）
     
-    normal_indices = np.where(normal_mask)[0]
-    fault_indices = np.where(fault_mask)[0]
+    if len(I_M) < 3 or len(I_P) < 3:
+        # 样本不足，随机选择
+        if verbose:
+            print("Warning: 样本不足，随机选择")
+        indices = np.random.choice(len(X), 6, replace=False)
+        return X[indices], indices
     
-    # 检查是否有足够的样本
-    if len(normal_indices) < 2 or len(fault_indices) < 2:
-        raise ValueError(f"需要至少2个正常样本和2个故障样本。当前: {len(normal_indices)}个正常, {len(fault_indices)}个故障")
+    H_M = entropies[I_M]  # 操控变量的熵
+    H_P = entropies[I_P]  # 过程变量的熵
     
-    # Step 1: 选择中间对 (x_i正常, x_j故障)
-    # 目标: |H_i - H_mean| + |H_j - H_mean| 最小
-    min_distance = float('inf')
-    best_i, best_j = None, None
+    if verbose:
+        print(f"香农熵统计:")
+        print(f"  总体均值: {H_mean:.4f}")
+        print(f"  操控变量 M (控制组): 均值={H_M.mean():.4f}, std={H_M.std():.4f}")
+        print(f"  过程变量 P (治疗组): 均值={H_P.mean():.4f}, std={H_P.std():.4f}")
+        # print(f"  验证格兰杰原理: H(M)={H_M.mean():.4f} {'<' if H_M.mean() < H_P.mean() else '>'} H(P)={H_P.mean():.4f}")
     
-    for i in normal_indices:
-        for j in fault_indices:
-            distance = np.abs(entropies[i] - H_mean) + np.abs(entropies[j] - H_mean)
-            if distance < min_distance:
-                min_distance = distance
-                best_i, best_j = i, j
+    # ========================================
+    # Step 1: 选择中间对 (x_i, x_j)
+    # ========================================
+    # 目标: argmin_{i∈P, j∈M} |H_i - H_mean| + |H_j - H_mean|
     
-    x_i = X[best_i]
-    x_j = X[best_j]
-    H_i = entropies[best_i]
-    H_j = entropies[best_j]
+    min_dist = np.inf
+    idx_i_local, idx_j_local = 0, 0
     
-    # Step 2: 选择正常工况极端对 (x_k, x_l)
-    # x_k: 与x_i熵差最大的正常样本
-    # x_l: 与x_k熵差最大的正常样本
-    normal_available = [idx for idx in normal_indices if idx != best_i]
+    for i in range(len(I_P)):
+        for j in range(len(I_M)):
+            dist = abs(H_P                                                                                                                          [i] - H_mean) + abs(H_M[j] - H_mean)
+            if dist < min_dist:
+                min_dist = dist
+                idx_i_local = i
+                idx_j_local = j
     
-    k_idx = max(normal_available, key=lambda idx: np.abs(entropies[idx] - H_i))
-    x_k = X[k_idx]
-    H_k = entropies[k_idx]
+    H_i = H_P[idx_i_local]
+    H_j = H_M[idx_j_local]
     
-    normal_available = [idx for idx in normal_available if idx != k_idx]
-    if len(normal_available) > 0:
-        l_idx = max(normal_available, key=lambda idx: np.abs(entropies[idx] - H_k))
-    else:
-        # 如果只剩一个正常样本，使用它
-        l_idx = k_idx
-    x_l = X[l_idx]
+    if verbose:
+        print(f"\nStep 1: 中间对")
+        print(f"  x_i (过程变量): H={H_i:.4f}, |H-mean|={abs(H_i-H_mean):.4f}")
+        print(f"  x_j (操控变量): H={H_j:.4f}, |H-mean|={abs(H_j-H_mean):.4f}")
     
-    # Step 3: 选择故障工况极端对 (x_m, x_n)
-    # x_m: 与x_j熵差最大的故障样本
-    # x_n: 与x_m熵差最大的故障样本
-    fault_available = [idx for idx in fault_indices if idx != best_j]
+    # ========================================
+    # Step 2: 选择操控变量极端对 (x_k, x_l)
+    # ========================================
+    # x_k: argmax_{k∈M} |H_k - H_i|
+    idx_k_local = np.argmax(np.abs(H_M - H_i))
+    H_k = H_M[idx_k_local]
+    # x_l: argmax_{l∈M} |H_l - H_k|（但不是 x_k 自己）
+    dist_to_k = np.abs(H_M - H_k)
+    dist_to_k[idx_k_local] = -1  # 排除 x_k 自己
+    idx_l_local = np.argmax(dist_to_k)
+    H_l = H_M[idx_l_local]
     
-    m_idx = max(fault_available, key=lambda idx: np.abs(entropies[idx] - H_j))
-    x_m = X[m_idx]
-    H_m = entropies[m_idx]
+    if verbose:
+        print(f"\nStep 2: 操控变量极端对")
+        print(f"  x_k: H={H_k:.4f}, |H_k-H_i|={abs(H_k-H_i):.4f}")
+        print(f"  x_l: H={H_l:.4f}, |H_l-H_k|={abs(H_l-H_k):.4f}")
     
-    fault_available = [idx for idx in fault_available if idx != m_idx]
-    if len(fault_available) > 0:
-        n_idx = max(fault_available, key=lambda idx: np.abs(entropies[idx] - H_m))
-    else:
-        # 如果只剩一个故障样本，使用它
-        n_idx = m_idx
-    x_n = X[n_idx]
+    # ========================================
+    # Step 3: 选择过程变量极端对 (x_m, x_n)
+    # ========================================
+    # x_m: argmax_{m∈P} |H_m - H_j|
+    idx_m_local = np.argmax(np.abs(H_P - H_j))
+    H_m = H_P[idx_m_local]
     
-    return x_i, x_j, x_k, x_l, x_m, x_n
+    # x_n: argmax_{n∈P} |H_n - H_m|（但不是 x_m 自己）
+    dist_to_m = np.abs(H_P - H_m)
+    dist_to_m[idx_m_local] = -1  # 排除 x_m 自己
+    idx_n_local = np.argmax(dist_to_m)
+    H_n = H_P[idx_n_local]
+    
+    if verbose:
+        print(f"\nStep 3: 过程变量极端对")
+        print(f"  x_m: H={H_m:.4f}, |H_m-H_j|={abs(H_m-H_j):.4f}")
+        print(f"  x_n: H={H_n:.4f}, |H_n-H_m|={abs(H_n-H_m):.4f}")
+    
+    # ========================================
+    # 组装三对样本
+    # ========================================
+    indices = np.array([
+        I_P[idx_i_local],  # x_i: 过程变量中间
+        I_M[idx_j_local],  # x_j: 操控变量中间
+        I_M[idx_k_local],  # x_k: 操控变量极端
+        I_M[idx_l_local],  # x_l: 操控变量相似
+        I_P[idx_m_local],  # x_m: 过程变量极端
+        I_P[idx_n_local],  # x_n: 过程变量相似
+    ])
+    
+    three_pairs = X[indices]
+    
+    return three_pairs, indices
 
 
-def compute_three_pairs_similarity_entropy(
-    x_i: np.ndarray,
-    x_j: np.ndarray,
-    x_k: np.ndarray,
-    x_l: np.ndarray,
-    x_m: np.ndarray,
-    x_n: np.ndarray,
-    n_bins: int = 30
-) -> Dict[str, float]:
+# ============================================================================
+# 3. 基于熵差计算相似度
+# ============================================================================
+
+def compute_three_pairs_similarity_granger(three_pairs: np.ndarray,
+                                          n_bins: int = 10) -> np.ndarray:
     """
-    计算三对样本之间的熵相似度
-    
-    返回5个相似度分数:
-    - s_ij: 中间对内部相似度 (正常-故障)
-    - s_kl: 正常工况对内部相似度
-    - s_mn: 故障工况对内部相似度
-    - s_i_kl: 中间对正常样本与正常极端对的相似度 (期望高)
-    - s_j_mn: 中间对故障样本与故障极端对的相似度 (期望高)
+    计算三对样本的五个相似度
     
     Args:
-        x_i, x_j: 中间对
-        x_k, x_l: 正常工况极端对
-        x_m, x_n: 故障工况极端对
-        n_bins: 熵计算分箱数
+        three_pairs: (6, n_features) [x_i, x_j, x_k, x_l, x_m, x_n]
+        n_bins: 分箱数
     
     Returns:
-        similarities: 包含5个相似度分数的字典
+        similarities: (5,) [S(k,l), S(m,n), S(k,m), S(i,k), S(j,m)]
     """
-    # 计算所有样本的熵
-    H_i = compute_shannon_entropy(x_i, n_bins)
-    H_j = compute_shannon_entropy(x_j, n_bins)
-    H_k = compute_shannon_entropy(x_k, n_bins)
-    H_l = compute_shannon_entropy(x_l, n_bins)
-    H_m = compute_shannon_entropy(x_m, n_bins)
-    H_n = compute_shannon_entropy(x_n, n_bins)
+    similarities = np.zeros(5)
     
-    # 计算相似度 s = exp(-|H_a - H_b|)
-    s_ij = np.exp(-np.abs(H_i - H_j))
-    s_kl = np.exp(-np.abs(H_k - H_l))
-    s_mn = np.exp(-np.abs(H_m - H_n))
+    # S(k, l): 操控变量极端对的相似度
+    similarities[0] = entropy_based_similarity(
+        three_pairs[2], three_pairs[3], n_bins
+    )
     
-    # 组间相似度 (使用平均熵)
-    H_kl_mean = (H_k + H_l) / 2
-    H_mn_mean = (H_m + H_n) / 2
+    # S(m, n): 过程变量极端对的相似度
+    similarities[1] = entropy_based_similarity(
+        three_pairs[4], three_pairs[5], n_bins
+    )
     
-    s_i_kl = np.exp(-np.abs(H_i - H_kl_mean))
-    s_j_mn = np.exp(-np.abs(H_j - H_mn_mean))
+    # S(k, m): 跨变量极端对的相似度
+    similarities[2] = entropy_based_similarity(
+        three_pairs[2], three_pairs[4], n_bins
+    )
     
-    return {
-        's_ij': s_ij,
-        's_kl': s_kl,
-        's_mn': s_mn,
-        's_i_kl': s_i_kl,
-        's_j_mn': s_j_mn
-    }
+    # S(i, k): 过程中间 vs 操控极端
+    similarities[3] = entropy_based_similarity(
+        three_pairs[0], three_pairs[2], n_bins
+    )
+    
+    # S(j, m): 操控中间 vs 过程极端
+    similarities[4] = entropy_based_similarity(
+        three_pairs[1], three_pairs[4], n_bins
+    )
+    
+    return similarities
 
 
 class PDDMNetwork(nn.Module):
     """
-    PDDM网络: 学习样本对之间的相似度
+    PDDM网络: 严格按照提供的复杂数学公式实现。
     
-    输入: 两个样本的差值u和平均值v
-    输出: 预测的相似度分数 [0, 1]
+    输入: 两个潜在空间样本 z_i 和 z_j。
+    输出: 预测的相似度分数 S_hat (线性输出)。
     
-    网络结构:
-    Input(u, v) → FC(hidden_dim) → ReLU → FC(hidden_dim) → ReLU → FC(1) → Sigmoid
+    数学描述:
+    u = |z_i - z_j|
+    v = |z_i + z_j| / 2  (保留了您之前描述中的绝对值)
+
+    u_norm = u / ||u||_2
+    v_norm = v / ||v||_2
+    u_1 = ReLU(W_u * u_norm + b_u)
+    v_1 = ReLU(W_v * v_norm + b_v)
+
+    u_1_norm = u_1 / ||u_1||_2
+    v_1_norm = v_1 / ||v_1||_2
+    h = ReLU(W_c * [u_1_norm, v_1_norm]^T + b_c)
+
+    S_hat = W_s * h + b_s
     """
     
-    def __init__(self, input_dim: int, hidden_dim: int = 64):
+    def __init__(self, latent_dim: int, u_v_hidden_dim: int = 32, h_hidden_dim: int = 64):
         """
         Args:
-            input_dim: 输入特征维度 (对于TEP，为39维)
-            hidden_dim: 隐藏层维度
+            latent_dim: 潜在空间维度 (即 z_i 的维度，例如 16)。
+            u_v_hidden_dim: 用于 u_1 和 v_1 子网络的隐藏层维度。
+            h_hidden_dim: 用于 h 层的隐藏层维度 (即 W_c 的输出维度)。
         """
-        super(PDDMNetwork, self).__init__()
+        super(PDDMComplexNetwork, self).__init__()
         
-        # u和v拼接后的维度是 2 * input_dim
-        self.fc1 = nn.Linear(2 * input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, 1)
+        # 参数 W_u, b_u 用于计算 u_1
+        self.W_u = nn.Linear(latent_dim, u_v_hidden_dim)
+        # 参数 W_v, b_v 用于计算 v_1
+        self.W_v = nn.Linear(latent_dim, u_v_hidden_dim)
         
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-    
-    def forward(self, x_i: torch.Tensor, x_j: torch.Tensor) -> torch.Tensor:
+        # 参数 W_c, b_c 用于计算 h
+        # 注意: u_1 和 v_1 拼接后维度是 2 * u_v_hidden_dim
+        self.W_c = nn.Linear(2 * u_v_hidden_dim, h_hidden_dim)
+        
+        # 参数 W_s, b_s 用于计算最终输出 S_hat
+        self.W_s = nn.Linear(h_hidden_dim, 1) # 输出维度为 1 (相似度得分)
+        
+        self.relu = nn.ReLU()
+        
+    def _normalize_vector(self, x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:
+        """
+        计算 L2 范数并归一化向量。
+        处理 L2 范数为零的情况，避免除以零。
+        """
+        norm = torch.norm(x, p=2, dim=dim, keepdim=True)
+        return x / (norm + eps) # 加上 eps 防止除以零
+
+    def forward(self, z_i: torch.Tensor, z_j: torch.Tensor) -> torch.Tensor:
         """
         前向传播
         
         Args:
-            x_i: 第一个样本 (batch_size, input_dim) 或 (input_dim,)
-            x_j: 第二个样本 (batch_size, input_dim) 或 (input_dim,)
+            z_i: 第一个潜在空间样本 (batch_size, latent_dim)
+            z_j: 第二个潜在空间样本 (batch_size, latent_dim)
         
         Returns:
-            similarity: 预测的相似度 (batch_size, 1) 或 (1,)
+            S_hat: 预测的相似度得分 (batch_size, 1)
         """
-        # 计算差值和平均值
-        u = torch.abs(x_i - x_j)  # 差值
-        v = (x_i + x_j) / 2.0      # 平均值
+        # 1. 计算 u 和 v
+        u = torch.abs(z_i - z_j)  # u = |z_i - z_j|
+        v = torch.abs(z_i + z_j) / 2.0 # v = |z_i + z_j| / 2 (根据您的公式，对和也取了绝对值)
         
-        # 拼接u和v
-        x = torch.cat([u, v], dim=-1)
+        # 2. 计算 u_1
+        u_norm = self._normalize_vector(u) # u / ||u||_2
+        u_1 = self.relu(self.W_u(u_norm))  # u_1 = ReLU(W_u * (u/||u||_2) + b_u)
         
-        # 网络前向传播
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = torch.sigmoid(self.fc3(x))
+        # 3. 计算 v_1
+        v_norm = self._normalize_vector(v) # v / ||v||_2
+        v_1 = self.relu(self.W_v(v_norm))  # v_1 = ReLU(W_v * (v/||v||_2) + b_v)
         
-        return x
-
+        # 4. 计算 h
+        u_1_norm = self._normalize_vector(u_1) # u_1 / ||u_1||_2
+        v_1_norm = self._normalize_vector(v_1) # v_1 / ||v_1||_2
+        
+        # 拼接归一化后的 u_1 和 v_1
+        u_v_concat = torch.cat([u_1_norm, v_1_norm], dim=-1) # [u_1/||u_1||_2, v_1/||v_1||_2]^T
+        h = self.relu(self.W_c(u_v_concat)) # h = ReLU(W_c * [...]^T + b_c)
+        
+        # 5. 计算最终输出 S_hat
+        S_hat = self.W_s(h) # S_hat = W_s * h + b_s
+        
+        return S_hat
 
 def compute_pddm_loss(
     pddm_net: PDDMNetwork,
