@@ -30,18 +30,23 @@ from sklearn.preprocessing import StandardScaler
 def compute_shannon_entropy(x: np.ndarray, n_bins: int = 30) -> float:
     """
     计算单个样本的Shannon熵
+    
+    Args:
+        x: 样本特征向量 (n_features,)
+        n_bins: 直方图分箱数量
+    
+    Returns:
+        Shannon熵值 H(X) = -Σ p(x) * log(p(x))
     """
     # 确保是1D数组
     x = x.flatten()
     
     # 计算直方图
-    hist, _ = np.histogram(x, bins=n_bins, density=False)
+    hist, _ = np.histogram(x, bins=n_bins, density=True)
     
     # 归一化为概率分布
     hist = hist + 1e-10  # 避免log(0)
     bin_width = (x.max() - x.min()) / n_bins
-    if bin_width == 0:
-        return 0.0
     prob = hist * bin_width
     prob = prob / prob.sum()  # 确保和为1
     
@@ -51,7 +56,7 @@ def compute_shannon_entropy(x: np.ndarray, n_bins: int = 30) -> float:
     return entropy
 
 
-def compute_column_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
+def compute_variable_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
     """
     计算批量样本的Shannon熵
     
@@ -60,7 +65,7 @@ def compute_column_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
         n_bins: 直方图分箱数量
     
     Returns:
-        entropies: 每个变量的熵值 (n_features,)
+        entropies: 每个样本的熵值 (n_samples,)
     """
     n_features = X.shape[1]
     entropies = np.zeros(n_features)
@@ -71,11 +76,11 @@ def compute_column_entropy(X: np.ndarray, n_bins: int = 30) -> np.ndarray:
     return entropies
 
 
-def entropy_based_similarity(x_i: np.ndarray, x_j: np.ndarray, sigma: float = 1.0) -> float:
+def entropy_based_similarity(x_i: np.ndarray, x_j: np.ndarray, n_bins: int = 30) -> float:
     """
     基于原始变量之间的相似度
     
-    相似度定义: s(i,j) = exp(-||x_i - x_j||^2 / (2*sigma^2))
+    相似度定义: s(i,j) = S(i,j)=0.75(|h_i+h_j/2-0.5|-|h_i-h_j/2+0.5|)
     熵差越小，相似度越高
     
     Args:
@@ -152,7 +157,7 @@ def find_three_pairs_entropy(
     M_col_indices = np.arange(22, 33) # 操控变量 (M组, 11个)
 
     # 1. 计算所有 *列* 的香农熵 (有意义的熵)
-    all_col_entropies = compute_column_entropy(X, n_bins) # Shape (n_features,)
+    all_col_entropies = compute_variable_entropy(X, n_bins) # Shape (n_features,)
     
     H_P = all_col_entropies[P_col_indices] # Shape (22,)
     H_M = all_col_entropies[M_col_indices] # Shape (11,)
@@ -265,8 +270,8 @@ def find_three_pairs_entropy(
 # 3. 基于熵差计算相似度
 # ============================================================================
 
-def compute_three_pairs_similarity(three_pairs: np.ndarray,
-                                          sigma: float = 1.0) -> np.ndarray:
+def compute_three_pairs_similarity_granger(three_pairs: np.ndarray,
+                                          n_bins: int = 10) -> np.ndarray:
     """
     计算三对样本的五个相似度
     
@@ -281,27 +286,27 @@ def compute_three_pairs_similarity(three_pairs: np.ndarray,
     
     # S(k, l): 操控变量极端对的相似度
     similarities[0] = entropy_based_similarity(
-        three_pairs[2], three_pairs[3], sigma
+        three_pairs[2], three_pairs[3], n_bins
     )
     
     # S(m, n): 过程变量极端对的相似度
     similarities[1] = entropy_based_similarity(
-        three_pairs[4], three_pairs[5], sigma
+        three_pairs[4], three_pairs[5], n_bins
     )
     
     # S(k, m): 跨变量极端对的相似度
     similarities[2] = entropy_based_similarity(
-        three_pairs[2], three_pairs[4], sigma
+        three_pairs[2], three_pairs[4], n_bins
     )
     
     # S(i, k): 过程中间 vs 操控极端
     similarities[3] = entropy_based_similarity(
-        three_pairs[0], three_pairs[2], sigma
+        three_pairs[0], three_pairs[2], n_bins
     )
     
     # S(j, m): 操控中间 vs 过程极端
     similarities[4] = entropy_based_similarity(
-        three_pairs[1], three_pairs[4], sigma
+        three_pairs[1], three_pairs[4], n_bins
     )
     
     return similarities
@@ -400,7 +405,7 @@ class PDDMNetwork(nn.Module):
 def compute_pddm_loss(
     pddm_net: PDDMNetwork,
     three_pairs: np.ndarray,
-    sigma: float = 1.0,
+    target_similarities: Dict[str, float]
 ) -> torch.Tensor:
     """
     计算PDDM损失函数
@@ -416,7 +421,6 @@ def compute_pddm_loss(
     Returns:
         loss: PDDM损失值
     """
-    three_pairs = torch.tensor(three_pairs, dtype=torch.float32)
     # 预测相似度
     pred_s_kl = pddm_net(three_pairs[2], three_pairs[3]).squeeze()
     pred_s_mn = pddm_net(three_pairs[4], three_pairs[5]).squeeze()
@@ -425,7 +429,7 @@ def compute_pddm_loss(
     pred_s_jm = pddm_net(three_pairs[1], three_pairs[4]).squeeze()
     
     # 目标相似度
-    target_similarities= compute_three_pairs_similarity(three_pairs, sigma)
+    target_similarities= compute_three_pairs_similarity_granger(three_pairs,10)
     
     target_similarities = torch.tensor(target_similarities, dtype=torch.float32)
 
@@ -439,4 +443,4 @@ def compute_pddm_loss(
         F.mse_loss(pred_s_jm, target_similarities[4])
     )
     
-    return (loss.mean())
+    return loss / 5.0
